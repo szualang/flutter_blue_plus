@@ -671,6 +671,78 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 
             result(@YES);
         }
+        else if ([@"writeCharacteristicQueuedBatch" isEqualToString:call.method])
+        {
+            // See BmWriteCharacteristicBatchRequest
+            NSDictionary *args = (NSDictionary*)call.arguments;
+            NSString *remoteId =          (NSString*) args[@"remote_id"];
+            NSString *primaryServiceUuid = args[@"primary_service_uuid"];
+            NSString *serviceUuid =       (NSString*) args[@"service_uuid"];
+            NSString *characteristicUuid =(NSString*) args[@"characteristic_uuid"];
+            NSNumber *instanceId =        (NSNumber*) args[@"instance_id"];
+            NSNumber *writeTypeIndex =    (NSNumber*) args[@"write_type"];
+            NSArray *values =             (NSArray*) args[@"values"];
+
+            CBPeripheral *peripheral = [self getConnectedPeripheral:remoteId];
+            if (!peripheral) {
+                result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch" message:@"device not connected" details:NULL]);
+                break;
+            }
+
+            NSError *error = nil;
+            CBCharacteristic *characteristic = [self locateCharacteristic:characteristicUuid
+                                                                peripheral:peripheral
+                                                        primaryServiceUuid:primaryServiceUuid
+                                                               serviceUuid:serviceUuid
+                                                                instanceId:instanceId
+                                                                     error:&error];
+            if (!characteristic) {
+                result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch" message:error.localizedDescription details:NULL]);
+                break;
+            }
+
+            BOOL supportsWriteWithResponse = (characteristic.properties & CBCharacteristicPropertyWrite) != 0;
+            BOOL supportsWriteWithoutResponse = (characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse) != 0;
+
+            if ([writeTypeIndex intValue] == 1 && !supportsWriteWithoutResponse) {
+                result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch"
+                                           message:@"writeWithoutResponse not supported" details:NULL]);
+                break;
+            }
+            if ([writeTypeIndex intValue] == 0 && !supportsWriteWithResponse) {
+                result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch"
+                                           message:@"writeWithResponse not supported" details:NULL]);
+                break;
+            }
+
+            int maxLen;
+            if ([writeTypeIndex intValue] == 1) {
+                maxLen = [self getMaxPayload:peripheral forType:CBCharacteristicWriteWithoutResponse allowLongWrite:NO];
+            } else {
+                maxLen = [self getMaxPayload:peripheral forType:CBCharacteristicWriteWithResponse allowLongWrite:NO];
+            }
+
+            NSString *primarySvcKey = primaryServiceUuid ?: @"";
+            NSString *key = [NSString stringWithFormat:@"%@:%@:%@:%@:%@", remoteId, primarySvcKey, serviceUuid, characteristicUuid, instanceId];
+
+            for (NSData *value in values) {
+                if ((int)[value length] > maxLen) {
+                    result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch"
+                                               message:@"value too long" details:NULL]);
+                    break;
+                }
+
+                BOOL enqueued = [self enqueueWriteTaskForKey:key value:value peripheral:peripheral characteristic:characteristic];
+                if (!enqueued) {
+                    result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch"
+                                               message:@"write queue is full"
+                                              details:NULL]);
+                    break;
+                }
+            }
+
+            result(@YES);
+        }
         else if ([@"readDescriptor" isEqualToString:call.method])
         {
             // See BmReadDescriptorRequest

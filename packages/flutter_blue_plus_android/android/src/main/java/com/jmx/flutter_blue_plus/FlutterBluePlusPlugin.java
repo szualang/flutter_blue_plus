@@ -1060,6 +1060,67 @@ public class FlutterBluePlusPlugin implements
                     break;
                 }
 
+                case "writeCharacteristicQueuedBatch": {
+                    String remoteId =              (String) data.get("remote_id");
+                    String primaryServiceUuid =    (String) data.get("primary_service_uuid");
+                    String serviceUuid =           (String) data.get("service_uuid");
+                    String characteristicUuid =    (String) data.get("characteristic_uuid");
+                    Integer instanceId =           (Integer) data.get("instance_id");
+                    int writeTypeInt =             (int) data.get("write_type");
+                    ArrayList<byte[]> values =     (ArrayList<byte[]>) data.get("values");
+
+                    int writeType = writeTypeInt == 0 ?
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT :
+                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE;
+
+                    // check connection
+                    BluetoothGatt gatt = mConnectedDevices.get(remoteId);
+                    if (gatt == null) {
+                        result.error("writeCharacteristicQueuedBatch", "device is disconnected", null);
+                        break;
+                    }
+
+                    // find characteristic
+                    ChrFound found = locateCharacteristic(gatt, primaryServiceUuid, serviceUuid, characteristicUuid, instanceId);
+                    if (found.error != null) {
+                        result.error("writeCharacteristicQueuedBatch", found.error, null);
+                        break;
+                    }
+
+                    BluetoothGattCharacteristic characteristic = found.characteristic;
+
+                    // check writable
+                    int props = characteristic.getProperties();
+                    boolean supportsWithResponse = (props & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0;
+                    boolean supportsWithoutResponse = (props & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0;
+                    if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT && !supportsWithResponse) {
+                        result.error("writeCharacteristicQueuedBatch",
+                            "The WRITE property is not supported by this BLE characteristic", null);
+                        break;
+                    }
+                    if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE && !supportsWithoutResponse) {
+                        result.error("writeCharacteristicQueuedBatch",
+                            "The WRITE_NO_RESPONSE property is not supported by this BLE characteristic", null);
+                        break;
+                    }
+
+                    // check max payload
+                    int maxLen = getMaxPayload(remoteId, writeType, false);
+
+                    // enqueue all values
+                    for (byte[] value : values) {
+                        if (value.length > maxLen) {
+                            String str = "data longer than allowed. dataLen: " + value.length + " > max: " + maxLen;
+                            result.error("writeCharacteristicQueuedBatch", str, null);
+                            break;
+                        }
+                        mWriteQueueManager.enqueue(remoteId, gatt, characteristic, value, writeType);
+                    }
+
+                    result.success(true);
+                    break;
+                }
+
                 case "readDescriptor":
                 {
                     // see: BmReadDescriptorRequest

@@ -295,6 +295,19 @@ abstract base class FlutterBluePlusPlatform {
     throw UnimplementedError('writeCharacteristicQueued has not been implemented.');
   }
 
+  /// Writes multiple values to a characteristic without waiting for
+  /// per-write completion events. All values are enqueued in the native
+  /// write queue in a single platform call.
+  ///
+  /// This is a batch variant of [writeCharacteristicQueued] intended for
+  /// high-throughput scenarios (e.g. OTA streaming) where many packets
+  /// of the same characteristic are sent back-to-back.
+  Future<void> writeCharacteristicQueuedBatch(
+    BmWriteCharacteristicBatchRequest request,
+  ) async {
+    throw UnimplementedError('writeCharacteristicQueuedBatch has not been implemented.');
+  }
+
   Future<bool> writeDescriptor(
     BmWriteDescriptorRequest request,
   ) {
