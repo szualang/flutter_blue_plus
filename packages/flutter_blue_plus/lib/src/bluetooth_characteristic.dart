@@ -256,15 +256,13 @@ class BluetoothCharacteristic {
   /// This method returns as soon as the request has been handed to the platform;
   /// it does not wait for the packet to be sent and therefore has no timeout.
   ///
-  ///  - [withoutResponse]: must be `true`.
+  ///  - [withoutResponse]: defaults to `true`. Pass `false` for with-response writes
+  ///    that will be queued in the native layer and flushed via onCharacteristicWrite
+  ///    callbacks.
   Future<void> writeQueued(
     List<int> value, {
     bool withoutResponse = true,
   }) async {
-    if (!withoutResponse) {
-      throw ArgumentError("writeQueued only supports withoutResponse=true");
-    }
-
     if (device.isDisconnected) {
       throw FlutterBluePlusException(ErrorPlatform.fbp, "writeCharacteristicQueued",
           FbpErrorCode.deviceIsDisconnected.index, "device is not connected");
@@ -276,7 +274,7 @@ class BluetoothCharacteristic {
       serviceUuid: serviceUuid,
       characteristicUuid: characteristicUuid,
       instanceId: instanceId,
-      writeType: BmWriteType.withoutResponse,
+      writeType: withoutResponse ? BmWriteType.withoutResponse : BmWriteType.withResponse,
       allowLongWrite: false,
       value: value,
     );

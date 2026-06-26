@@ -599,6 +599,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             NSString  *characteristicUuid = args[@"characteristic_uuid"];
             NSNumber  *instanceId         = args[@"instance_id"];
             NSData    *value              = [args[@"value"] data];
+            int writeTypeIndex = [args[@"write_type"] intValue]; // 0=withResponse, 1=withoutResponse
 
             // Find peripheral
             CBPeripheral *peripheral = [self getConnectedPeripheral:remoteId];
@@ -622,16 +623,28 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                 return;
             }
 
-            // check writeable
-            if ((characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse) == 0) {
+            // check writeable (must match the requested write type)
+            BOOL supportsWriteWithoutResponse = (characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse) != 0;
+            BOOL supportsWriteWithResponse = (characteristic.properties & CBCharacteristicPropertyWrite) != 0;
+            if (writeTypeIndex == 1 && !supportsWriteWithoutResponse) {
                 result([FlutterError errorWithCode:@"writeCharacteristicQueued"
-                                           message:@"not supported" details:NULL]);
+                                           message:@"writeWithoutResponse not supported" details:NULL]);
+                return;
+            }
+            if (writeTypeIndex == 0 && !supportsWriteWithResponse) {
+                result([FlutterError errorWithCode:@"writeCharacteristicQueued"
+                                           message:@"writeWithResponse not supported" details:NULL]);
                 return;
             }
 
+            // determine write type
+            CBCharacteristicWriteType writeType = writeTypeIndex == 0
+                ? CBCharacteristicWriteWithResponse
+                : CBCharacteristicWriteWithoutResponse;
+
             // check maximum payload
             int maxLen = [self getMaxPayload:peripheral
-                                     forType:CBCharacteristicWriteWithoutResponse
+                                     forType:writeType
                                 allowLongWrite:NO];
             if ((int)[value length] > maxLen) {
                 result([FlutterError errorWithCode:@"writeCharacteristicQueued"
@@ -646,7 +659,8 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             BOOL enqueued = [self enqueueWriteTaskForKey:key
                                                    value:value
                                               peripheral:peripheral
-                                          characteristic:characteristic];
+                                          characteristic:characteristic
+                                               writeType:writeType];
 
             if (!enqueued) {
                 result([FlutterError errorWithCode:@"writeCharacteristicQueued"
@@ -1799,6 +1813,11 @@ didDiscoverCharacteristicsForService:(CBService *)service
     if (!primaryService) {[result removeObjectForKey:@"primary_service_uuid"];}
 
     [self.methodChannel invokeMethod:@"OnCharacteristicWritten" arguments:result];
+
+    // Trigger queue flush for withResponse writes
+    NSString *queueKey = [NSString stringWithFormat:@"%@:%@:%@:%@:%@",
+        remoteId, primarySvcKey, serviceUuid, characteristicUuid, instanceId];
+    [self flushWriteQueueForKey:queueKey];
 }
 
 - (void)peripheral:(CBPeripheral *)peripheral
@@ -2060,6 +2079,7 @@ didDiscoverCharacteristicsForService:(CBService *)service
                          value:(NSData*)value
                     peripheral:(CBPeripheral*)peripheral
                 characteristic:(CBCharacteristic*)characteristic
+                     writeType:(CBCharacteristicWriteType)writeType
 {
     NSMutableArray *queue = self.writeQueues[key];
     if (!queue) {
@@ -2076,6 +2096,7 @@ didDiscoverCharacteristicsForService:(CBService *)service
         @"value": value,
         @"peripheral": peripheral,
         @"characteristic": characteristic,
+        @"writeType": @(writeType),
     }];
 
     [self flushWriteQueueForKey:key];
@@ -2089,8 +2110,13 @@ didDiscoverCharacteristicsForService:(CBService *)service
     while (queue.count > 0) {
         NSDictionary *task = queue[0];
         CBPeripheral *peripheral = task[@"peripheral"];
+        CBCharacteristicWriteType writeType = [task[@"writeType"] intValue] == (int)CBCharacteristicWriteWithResponse
+            ? CBCharacteristicWriteWithResponse
+            : CBCharacteristicWriteWithoutResponse;
 
-        if (!peripheral.canSendWriteWithoutResponse) {
+        // withoutResponse requires canSendWriteWithoutResponse check
+        if (writeType == CBCharacteristicWriteWithoutResponse &&
+            !peripheral.canSendWriteWithoutResponse) {
             break;
         }
 
@@ -2100,7 +2126,11 @@ didDiscoverCharacteristicsForService:(CBService *)service
         NSData *value = task[@"value"];
         [peripheral writeValue:value
              forCharacteristic:characteristic
-                          type:CBCharacteristicWriteWithoutResponse];
+                          type:writeType];
+    }
+
+    if (queue.count == 0) {
+        [self.writeQueues removeObjectForKey:key];
     }
 }
 

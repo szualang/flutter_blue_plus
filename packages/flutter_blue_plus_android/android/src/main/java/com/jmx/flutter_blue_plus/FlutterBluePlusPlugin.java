@@ -1004,6 +1004,11 @@ public class FlutterBluePlusPlugin implements
                     String characteristicUuid = (String) data.get("characteristic_uuid");
                     Integer instanceId =       (Integer) data.get("instance_id");
                     byte[] value =              (byte[]) data.get("value");
+                    int writeTypeInt =             (int) data.get("write_type");
+
+                    int writeType = writeTypeInt == 0 ?
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT :
+                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE;
 
                     // check connection
                     BluetoothGatt gatt = mConnectedDevices.get(remoteId);
@@ -1021,24 +1026,32 @@ public class FlutterBluePlusPlugin implements
 
                     BluetoothGattCharacteristic characteristic = found.characteristic;
 
-                    // check writeable (queued writes are always withoutResponse)
-                    if ((characteristic.getProperties() & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) == 0) {
+                    // check writeable
+                    int props = characteristic.getProperties();
+                    boolean supportsWithResponse = (props & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0;
+                    boolean supportsWithoutResponse = (props & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0;
+                    if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT && !supportsWithResponse) {
+                        result.error("writeCharacteristicQueued",
+                            "The WRITE property is not supported by this BLE characteristic", null);
+                        break;
+                    }
+                    if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE && !supportsWithoutResponse) {
                         result.error("writeCharacteristicQueued",
                             "The WRITE_NO_RESPONSE property is not supported by this BLE characteristic", null);
                         break;
                     }
 
                     // check maximum payload
-                    int maxLen = getMaxPayload(remoteId, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE, false);
+                    int maxLen = getMaxPayload(remoteId, writeType, false);
                     int dataLen = value.length;
                     if (dataLen > maxLen) {
-                        String str = "data longer than allowed. dataLen: " + dataLen + " > max: " + maxLen + " (withoutResponse)";
+                        String str = "data longer than allowed. dataLen: " + dataLen + " > max: " + maxLen;
                         result.error("writeCharacteristicQueued", str, null);
                         break;
                     }
 
                     // enqueue the write
-                    if (!mWriteQueueManager.enqueue(remoteId, gatt, characteristic, value)) {
+                    if (!mWriteQueueManager.enqueue(remoteId, gatt, characteristic, value, writeType)) {
                         result.error("writeCharacteristicQueued", "write queue is full", null);
                         break;
                     }
@@ -3223,10 +3236,12 @@ public class FlutterBluePlusPlugin implements
             final BluetoothGatt gatt;
             final BluetoothGattCharacteristic characteristic;
             final byte[] value;
-            WriteTask(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte[] value) {
+            final int writeType;
+            WriteTask(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte[] value, int writeType) {
                 this.gatt = gatt;
                 this.characteristic = characteristic;
                 this.value = value;
+                this.writeType = writeType;
             }
         }
 
@@ -3236,14 +3251,15 @@ public class FlutterBluePlusPlugin implements
         }
 
         boolean enqueue(String remoteId, BluetoothGatt gatt,
-                        BluetoothGattCharacteristic characteristic, byte[] value) {
+                        BluetoothGattCharacteristic characteristic, byte[] value,
+                        int writeType) {
             synchronized (this) {
                 Queue<WriteTask> queue = mQueues.computeIfAbsent(
                     remoteId, k -> new LinkedBlockingQueue<>());
                 if (queue.size() >= MAX_QUEUED_WRITES) {
                     return false;
                 }
-                queue.offer(new WriteTask(gatt, characteristic, value));
+                queue.offer(new WriteTask(gatt, characteristic, value, writeType));
             }
             processNext(remoteId);
             return true;
@@ -3274,13 +3290,11 @@ public class FlutterBluePlusPlugin implements
                 boolean ok;
                 if (Build.VERSION.SDK_INT >= 33) {
                     int rv = task.gatt.writeCharacteristic(
-                        task.characteristic, task.value,
-                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+                        task.characteristic, task.value, task.writeType);
                     ok = (rv == BluetoothStatusCodes.SUCCESS);
                 } else {
                     task.characteristic.setValue(task.value);
-                    task.characteristic.setWriteType(
-                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+                    task.characteristic.setWriteType(task.writeType);
                     ok = task.gatt.writeCharacteristic(task.characteristic);
                 }
 
