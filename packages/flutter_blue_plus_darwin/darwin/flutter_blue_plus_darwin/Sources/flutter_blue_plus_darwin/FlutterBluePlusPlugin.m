@@ -6,6 +6,7 @@
 #include <Foundation/NSObjCRuntime.h>
 
 #define Log(LEVEL, FORMAT, ...) [self log:LEVEL format:@"[FBP-iOS] " FORMAT, ##__VA_ARGS__]
+#define MAX_QUEUED_WRITES 1000
 
 NSString * const CCCD = @"2902";
 
@@ -49,6 +50,8 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 @property(nonatomic) LogLevel logLevel;
 @property(nonatomic) NSNumber *showPowerAlert;
 @property(nonatomic) NSNumber *restoreState;
+@property(nonatomic, strong) NSMutableDictionary<NSString*, NSMutableArray<NSDictionary*>*> *writeQueues;
+@property(nonatomic, strong) NSMutableDictionary<NSString*, NSNumber*> *writeQueueSizes;
 @end
 
 @implementation FlutterBluePlusPlugin
@@ -69,6 +72,8 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     instance.writeChrs = [NSMutableDictionary new];
     instance.writeDescs = [NSMutableDictionary new];
     instance.scanCounts = [NSMutableDictionary new];
+    instance.writeQueues = [NSMutableDictionary dictionary];
+    instance.writeQueueSizes = [NSMutableDictionary dictionary];
     instance.logLevel = LDEBUG;
     instance.showPowerAlert = @(YES);
     instance.restoreState = @(NO);
@@ -583,6 +588,67 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             if (writeType == CBCharacteristicWriteWithoutResponse) {
                 [self.didWriteWithoutResponse setObject:args forKey:remoteId];
             }
+
+            result(@YES);
+        }
+        else if ([@"writeCharacteristicQueued" isEqualToString:call.method])
+        {
+            // See BmWriteCharacteristicRequest
+            NSDictionary *args = (NSDictionary*)call.arguments;
+            NSString  *remoteId           = args[@"remote_id"];
+            NSString  *primaryServiceUuid = args[@"primary_service_uuid"];
+            NSString  *serviceUuid        = args[@"service_uuid"];
+            NSString  *characteristicUuid = args[@"characteristic_uuid"];
+            NSNumber  *instanceId         = args[@"instance_id"];
+            NSData    *value              = [args[@"value"] data];
+
+            // Find peripheral
+            CBPeripheral *peripheral = [self getConnectedPeripheral:remoteId];
+            if (peripheral == nil) {
+                result([FlutterError errorWithCode:@"writeCharacteristicQueued"
+                                           message:@"device not connected" details:NULL]);
+                return;
+            }
+
+            // Find characteristic
+            NSError *error = nil;
+            CBCharacteristic *characteristic = [self locateCharacteristic:characteristicUuid
+                                                               peripheral:peripheral
+                                                       primaryServiceUuid:primaryServiceUuid
+                                                              serviceUuid:serviceUuid
+                                                               instanceId:instanceId
+                                                                    error:&error];
+            if (characteristic == nil) {
+                result([FlutterError errorWithCode:@"writeCharacteristicQueued"
+                                           message:@"characteristic not found" details:NULL]);
+                return;
+            }
+
+            // check writeable
+            if ((characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse) == 0) {
+                result([FlutterError errorWithCode:@"writeCharacteristicQueued"
+                                           message:@"not supported" details:NULL]);
+                return;
+            }
+
+            // check maximum payload
+            int maxLen = [self getMaxPayload:peripheral
+                                     forType:CBCharacteristicWriteWithoutResponse
+                                allowLongWrite:NO];
+            if ((int)[value length] > maxLen) {
+                result([FlutterError errorWithCode:@"writeCharacteristicQueued"
+                                           message:@"value too long" details:NULL]);
+                return;
+            }
+
+            NSString *primarySvcKey = primaryServiceUuid != nil ? primaryServiceUuid : @"";
+            NSString *key = [NSString stringWithFormat:@"%@:%@:%@:%@:%@",
+                remoteId, primarySvcKey, serviceUuid, characteristicUuid, instanceId];
+
+            [self enqueueWriteTaskForKey:key
+                                   value:value
+                              peripheral:peripheral
+                          characteristic:characteristic];
 
             result(@YES);
         }
@@ -1450,6 +1516,18 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     [self.didWriteWithoutResponse removeObjectForKey:remoteId];
     [self clearCachedWritesForRemoteId:remoteId];
 
+    // clear queued writes for this peripheral
+    NSMutableArray *keysToRemove = [NSMutableArray array];
+    for (NSString *key in self.writeQueues.allKeys) {
+        if ([key hasPrefix:[NSString stringWithFormat:@"%@:", remoteId]]) {
+            [keysToRemove addObject:key];
+        }
+    }
+    for (NSString *key in keysToRemove) {
+        [self.writeQueues removeObjectForKey:key];
+        [self.writeQueueSizes removeObjectForKey:key];
+    }
+
     // Unregister self as delegate for peripheral, not working #42
     peripheral.delegate = nil;
 
@@ -1957,6 +2035,62 @@ didDiscoverCharacteristicsForService:(CBService *)service
     if (!primaryServiceUuid) {[result removeObjectForKey:@"primary_service_uuid"];}
 
     [self.methodChannel invokeMethod:@"OnCharacteristicWritten" arguments:result];
+
+    // flush queued writes
+    for (NSString *key in [self.writeQueues allKeys]) {
+        [self flushWriteQueueForKey:key];
+    }
+}
+
+- (void)enqueueWriteTaskForKey:(NSString*)key
+                         value:(NSData*)value
+                    peripheral:(CBPeripheral*)peripheral
+                characteristic:(CBCharacteristic*)characteristic
+{
+    NSNumber *currentSize = self.writeQueueSizes[key];
+    if (currentSize && [currentSize intValue] >= MAX_QUEUED_WRITES) {
+        Log(LERROR, @"writeCharacteristicQueued: queue full");
+        return;
+    }
+
+    NSMutableArray *queue = self.writeQueues[key];
+    if (!queue) {
+        queue = [NSMutableArray array];
+        self.writeQueues[key] = queue;
+        self.writeQueueSizes[key] = @0;
+    }
+
+    [queue addObject:@{
+        @"value": value,
+        @"peripheral": peripheral,
+        @"characteristic": characteristic,
+    }];
+
+    self.writeQueueSizes[key] = @([self.writeQueueSizes[key] intValue] + 1);
+
+    [self flushWriteQueueForKey:key];
+}
+
+- (void)flushWriteQueueForKey:(NSString*)key
+{
+    NSMutableArray *queue = self.writeQueues[key];
+    while (queue.count > 0) {
+        NSDictionary *task = queue[0];
+        CBPeripheral *peripheral = task[@"peripheral"];
+
+        if (!peripheral.canSendWriteWithoutResponse) {
+            break;
+        }
+
+        [queue removeObjectAtIndex:0];
+        self.writeQueueSizes[key] = @([self.writeQueueSizes[key] intValue] - 1);
+
+        CBCharacteristic *characteristic = task[@"characteristic"];
+        NSData *value = task[@"value"];
+        [peripheral writeValue:value
+             forCharacteristic:characteristic
+                          type:CBCharacteristicWriteWithoutResponse];
+    }
 }
 
 //////////////////////////////////////////////////////////////////////
