@@ -3271,9 +3271,9 @@ public class FlutterBluePlusPlugin implements
                 Queue<WriteTask> queue = mQueues.get(remoteId);
                 if (queue == null || queue.isEmpty()) return;
 
-                WriteTask task = queue.poll();
+                // peek at the next task to determine write type
+                WriteTask task = queue.peek();
                 if (task == null) {
-                    mIsWriting.put(remoteId, false);
                     return;
                 }
 
@@ -3281,6 +3281,38 @@ public class FlutterBluePlusPlugin implements
                 BluetoothGatt currentGatt = mConnectedDevices.get(remoteId);
                 if (currentGatt == null || currentGatt != task.gatt) {
                     clear(remoteId);
+                    return;
+                }
+
+                // For WRITE_TYPE_NO_RESPONSE: fire all waiting writes in a burst.
+                // Android BLE stack queues these internally; onCharacteristicWrite
+                // is NOT guaranteed to fire for withoutResponse writes, so we cannot
+                // rely on it to trigger the next dequeue.
+                if (task.writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
+                    while ((task = queue.poll()) != null) {
+                        boolean ok;
+                        if (Build.VERSION.SDK_INT >= 33) {
+                            int rv = task.gatt.writeCharacteristic(
+                                task.characteristic, task.value, task.writeType);
+                            ok = (rv == BluetoothStatusCodes.SUCCESS);
+                        } else {
+                            task.characteristic.setValue(task.value);
+                            task.characteristic.setWriteType(task.writeType);
+                            ok = task.gatt.writeCharacteristic(task.characteristic);
+                        }
+                        if (!ok) {
+                            Log.e(TAG, "writeCharacteristicQueued burst failed for " + remoteId);
+                            clear(remoteId);
+                            return;
+                        }
+                    }
+                    // queue is now empty; nothing to wait for
+                    return;
+                }
+
+                // For WRITE_TYPE_DEFAULT (withResponse): serialized, one at a time
+                task = queue.poll();
+                if (task == null) {
                     return;
                 }
 
