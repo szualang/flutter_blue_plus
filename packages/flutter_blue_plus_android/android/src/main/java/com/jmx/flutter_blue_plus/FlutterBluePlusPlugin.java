@@ -44,11 +44,13 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.io.StringWriter;
 import java.io.PrintWriter;
@@ -112,6 +114,7 @@ public class FlutterBluePlusPlugin implements
     private final Map<String, BluetoothGatt> mAutoConnected = new ConcurrentHashMap<>();
     private final Map<String, byte[]> mWriteChr = new ConcurrentHashMap<>();
     private final Map<String, byte[]> mWriteDesc = new ConcurrentHashMap<>();
+    private final WriteQueueManager mWriteQueueManager = new WriteQueueManager(mConnectedDevices);
     private final Map<String, String> mAdvSeen = new ConcurrentHashMap<>();
     private final Map<String, Integer> mScanCounts = new ConcurrentHashMap<>();
     private HashMap<String, Object> mScanFilters = new HashMap<String, Object>();
@@ -985,6 +988,59 @@ public class FlutterBluePlusPlugin implements
                             result.error("writeCharacteristic", "gatt.writeCharacteristic() returned false", null);
                             break;
                         }
+                    }
+
+                    result.success(true);
+                    break;
+                }
+
+                case "writeCharacteristicQueued":
+                {
+                    // see: BmWriteCharacteristicRequest
+                    HashMap<String, Object> data = call.arguments();
+                    String remoteId =           (String) data.get("remote_id");
+                    String primaryServiceUuid = (String) data.get("primary_service_uuid");
+                    String serviceUuid =        (String) data.get("service_uuid");
+                    String characteristicUuid = (String) data.get("characteristic_uuid");
+                    Integer instanceId =       (Integer) data.get("instance_id");
+                    byte[] value =              (byte[]) data.get("value");
+
+                    // check connection
+                    BluetoothGatt gatt = mConnectedDevices.get(remoteId);
+                    if (gatt == null) {
+                        result.error("writeCharacteristicQueued", "device is disconnected", null);
+                        break;
+                    }
+
+                    // find characteristic
+                    ChrFound found = locateCharacteristic(gatt, primaryServiceUuid, serviceUuid, characteristicUuid, instanceId);
+                    if (found.error != null) {
+                        result.error("writeCharacteristicQueued", found.error, null);
+                        break;
+                    }
+
+                    BluetoothGattCharacteristic characteristic = found.characteristic;
+
+                    // check writeable (queued writes are always withoutResponse)
+                    if ((characteristic.getProperties() & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) == 0) {
+                        result.error("writeCharacteristicQueued",
+                            "The WRITE_NO_RESPONSE property is not supported by this BLE characteristic", null);
+                        break;
+                    }
+
+                    // check maximum payload
+                    int maxLen = getMaxPayload(remoteId, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE, false);
+                    int dataLen = value.length;
+                    if (dataLen > maxLen) {
+                        String str = "data longer than allowed. dataLen: " + dataLen + " > max: " + maxLen + " (withoutResponse)";
+                        result.error("writeCharacteristicQueued", str, null);
+                        break;
+                    }
+
+                    // enqueue the write
+                    if (!mWriteQueueManager.enqueue(remoteId, gatt, characteristic, value)) {
+                        result.error("writeCharacteristicQueued", "write queue is full", null);
+                        break;
                     }
 
                     result.success(true);
@@ -2284,6 +2340,9 @@ public class FlutterBluePlusPlugin implements
                     // remove from cached PINs
                     mBondingPins.remove(remoteId);
 
+                    // clear queued writes
+                    mWriteQueueManager.onDisconnected(remoteId);
+
                     // we cannot call 'close' for autoconnected devices
                     // because it prevents autoconnect from working
                     if (mAutoConnected.containsKey(remoteId)) {
@@ -2490,6 +2549,8 @@ public class FlutterBluePlusPlugin implements
             response.put("error_string", gattErrorString(status));
 
             invokeMethodUIThread("OnCharacteristicWritten", response);
+
+            mWriteQueueManager.onCharacteristicWrite(remoteId, status);
         }
 
         @Override
@@ -3144,5 +3205,121 @@ public class FlutterBluePlusPlugin implements
         INFO,    // 3
         DEBUG,   // 4
         VERBOSE  // 5
+    }
+
+    private static class WriteQueueManager {
+        static final int MAX_QUEUED_WRITES = 1000;
+        private final Map<String, BluetoothGatt> mConnectedDevices;
+        private final ConcurrentHashMap<String, Queue<WriteTask>> mQueues = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<String, Boolean> mIsWriting = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<String, Boolean> mPendingQueuedWrite = new ConcurrentHashMap<>();
+        private final Handler mHandler = new Handler(Looper.getMainLooper());
+
+        WriteQueueManager(Map<String, BluetoothGatt> connectedDevices) {
+            this.mConnectedDevices = connectedDevices;
+        }
+
+        static class WriteTask {
+            final BluetoothGatt gatt;
+            final BluetoothGattCharacteristic characteristic;
+            final byte[] value;
+            WriteTask(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte[] value) {
+                this.gatt = gatt;
+                this.characteristic = characteristic;
+                this.value = value;
+            }
+        }
+
+        int size(String remoteId) {
+            Queue<WriteTask> queue = mQueues.get(remoteId);
+            return queue == null ? 0 : queue.size();
+        }
+
+        boolean enqueue(String remoteId, BluetoothGatt gatt,
+                        BluetoothGattCharacteristic characteristic, byte[] value) {
+            synchronized (this) {
+                Queue<WriteTask> queue = mQueues.computeIfAbsent(
+                    remoteId, k -> new LinkedBlockingQueue<>());
+                if (queue.size() >= MAX_QUEUED_WRITES) {
+                    return false;
+                }
+                queue.offer(new WriteTask(gatt, characteristic, value));
+            }
+            processNext(remoteId);
+            return true;
+        }
+
+        void processNext(String remoteId) {
+            synchronized (this) {
+                if (Boolean.TRUE.equals(mIsWriting.get(remoteId))) return;
+                Queue<WriteTask> queue = mQueues.get(remoteId);
+                if (queue == null || queue.isEmpty()) return;
+
+                WriteTask task = queue.poll();
+                if (task == null) {
+                    mIsWriting.put(remoteId, false);
+                    return;
+                }
+
+                // make sure the gatt is still the connected one
+                BluetoothGatt currentGatt = mConnectedDevices.get(remoteId);
+                if (currentGatt == null || currentGatt != task.gatt) {
+                    clear(remoteId);
+                    return;
+                }
+
+                mIsWriting.put(remoteId, true);
+                mPendingQueuedWrite.put(remoteId, true);
+
+                boolean ok;
+                if (Build.VERSION.SDK_INT >= 33) {
+                    int rv = task.gatt.writeCharacteristic(
+                        task.characteristic, task.value,
+                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+                    ok = (rv == BluetoothStatusCodes.SUCCESS);
+                } else {
+                    task.characteristic.setValue(task.value);
+                    task.characteristic.setWriteType(
+                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+                    ok = task.gatt.writeCharacteristic(task.characteristic);
+                }
+
+                if (!ok) {
+                    mPendingQueuedWrite.remove(remoteId);
+                    mIsWriting.put(remoteId, false);
+                    Log.e(TAG, "writeCharacteristicQueued failed to initiate for " + remoteId);
+                    clear(remoteId);
+                }
+            }
+        }
+
+        void onCharacteristicWrite(String remoteId, int status) {
+            synchronized (this) {
+                if (!Boolean.TRUE.equals(mPendingQueuedWrite.remove(remoteId))) {
+                    // not a callback triggered by a queued write, ignore
+                    return;
+                }
+                mIsWriting.put(remoteId, false);
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.e(TAG, "writeCharacteristicQueued failed with status " + status + " for " + remoteId);
+                    clear(remoteId);
+                    return;
+                }
+            }
+            mHandler.post(() -> processNext(remoteId));
+        }
+
+        void clear(String remoteId) {
+            synchronized (this) {
+                Queue<WriteTask> queue = mQueues.remove(remoteId);
+                if (queue != null) queue.clear();
+                mIsWriting.remove(remoteId);
+                mPendingQueuedWrite.remove(remoteId);
+            }
+        }
+
+        void onDisconnected(String remoteId) {
+            clear(remoteId);
+        }
     }
 }
