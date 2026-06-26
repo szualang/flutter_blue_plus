@@ -249,6 +249,43 @@ class BluetoothCharacteristic {
     }
   }
 
+  /// Write a value to the characteristic without waiting for the platform response
+  /// event. This is intended for high-throughput scenarios (e.g. OTA streaming)
+  /// where writes should be queued by the platform rather than awaited one-by-one.
+  ///
+  /// This method returns as soon as the request has been handed to the platform;
+  /// it does not wait for the packet to be sent and therefore has no timeout.
+  ///
+  ///  - [withoutResponse]: must be `true`.
+  Future<void> writeQueued(
+    List<int> value, {
+    bool withoutResponse = true,
+  }) async {
+    if (!withoutResponse) {
+      throw ArgumentError("writeQueued only supports withoutResponse=true");
+    }
+
+    if (device.isDisconnected) {
+      throw FlutterBluePlusException(ErrorPlatform.fbp, "writeCharacteristicQueued",
+          FbpErrorCode.deviceIsDisconnected.index, "device is not connected");
+    }
+
+    var request = BmWriteCharacteristicRequest(
+      remoteId: remoteId,
+      primaryServiceUuid: primaryServiceUuid,
+      serviceUuid: serviceUuid,
+      characteristicUuid: characteristicUuid,
+      instanceId: instanceId,
+      writeType: BmWriteType.withoutResponse,
+      allowLongWrite: false,
+      value: value,
+    );
+
+    await FlutterBluePlus._invokePlatform(
+      () => FlutterBluePlusPlatform.instance.writeCharacteristicQueued(request),
+    );
+  }
+
   /// Sets notifications or indications for the characteristic.
   ///   - If a characteristic supports both notifications and indications,
   ///     we use notifications. This is a limitation of CoreBluetooth on iOS.
