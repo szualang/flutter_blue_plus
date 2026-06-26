@@ -1060,7 +1060,10 @@ public class FlutterBluePlusPlugin implements
                     break;
                 }
 
-                case "writeCharacteristicQueuedBatch": {
+                case "writeCharacteristicQueuedBatch":
+                {
+                    // see: BmWriteCharacteristicBatchRequest
+                    HashMap<String, Object> data = call.arguments();
                     String remoteId =              (String) data.get("remote_id");
                     String primaryServiceUuid =    (String) data.get("primary_service_uuid");
                     String serviceUuid =           (String) data.get("service_uuid");
@@ -1107,17 +1110,21 @@ public class FlutterBluePlusPlugin implements
                     // check max payload
                     int maxLen = getMaxPayload(remoteId, writeType, false);
 
-                    // enqueue all values
+                    // enqueue all values; validate length before any enqueue
+                    boolean batchError = false;
                     for (byte[] value : values) {
                         if (value.length > maxLen) {
                             String str = "data longer than allowed. dataLen: " + value.length + " > max: " + maxLen;
                             result.error("writeCharacteristicQueuedBatch", str, null);
+                            batchError = true;
                             break;
                         }
                         mWriteQueueManager.enqueue(remoteId, gatt, characteristic, value, writeType);
                     }
 
-                    result.success(true);
+                    if (!batchError) {
+                        result.success(true);
+                    }
                     break;
                 }
 
