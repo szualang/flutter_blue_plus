@@ -51,7 +51,6 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 @property(nonatomic) NSNumber *showPowerAlert;
 @property(nonatomic) NSNumber *restoreState;
 @property(nonatomic, strong) NSMutableDictionary<NSString*, NSMutableArray<NSDictionary*>*> *writeQueues;
-@property(nonatomic, strong) NSMutableDictionary<NSString*, NSNumber*> *writeQueueSizes;
 @end
 
 @implementation FlutterBluePlusPlugin
@@ -73,7 +72,6 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     instance.writeDescs = [NSMutableDictionary new];
     instance.scanCounts = [NSMutableDictionary new];
     instance.writeQueues = [NSMutableDictionary dictionary];
-    instance.writeQueueSizes = [NSMutableDictionary dictionary];
     instance.logLevel = LDEBUG;
     instance.showPowerAlert = @(YES);
     instance.restoreState = @(NO);
@@ -645,10 +643,17 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             NSString *key = [NSString stringWithFormat:@"%@:%@:%@:%@:%@",
                 remoteId, primarySvcKey, serviceUuid, characteristicUuid, instanceId];
 
-            [self enqueueWriteTaskForKey:key
-                                   value:value
-                              peripheral:peripheral
-                          characteristic:characteristic];
+            BOOL enqueued = [self enqueueWriteTaskForKey:key
+                                                   value:value
+                                              peripheral:peripheral
+                                          characteristic:characteristic];
+
+            if (!enqueued) {
+                result([FlutterError errorWithCode:@"writeCharacteristicQueued"
+                                           message:@"write queue is full"
+                                           details:NULL]);
+                return;
+            }
 
             result(@YES);
         }
@@ -1525,7 +1530,6 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     }
     for (NSString *key in keysToRemove) {
         [self.writeQueues removeObjectForKey:key];
-        [self.writeQueueSizes removeObjectForKey:key];
     }
 
     // Unregister self as delegate for peripheral, not working #42
@@ -1990,13 +1994,23 @@ didDiscoverCharacteristicsForService:(CBService *)service
     // when a 'writeWithoutResponse' request has completed. 
     // The dart code will wait for this signal, so that we don't
     // queue writes too fast, which iOS would then drop the packets.
-    
-    NSDictionary *request = [self.didWriteWithoutResponse objectForKey:[[peripheral identifier] UUIDString]];
+
+    NSString *remoteId = [[peripheral identifier] UUIDString];
+
+    // flush queued writes for this peripheral first, regardless of whether
+    // there is a pending non-queued write notification to deliver.
+    NSString *prefix = [NSString stringWithFormat:@"%@:", remoteId];
+    for (NSString *key in [self.writeQueues allKeys]) {
+        if ([key hasPrefix:prefix]) {
+            [self flushWriteQueueForKey:key];
+        }
+    }
+
+    NSDictionary *request = [self.didWriteWithoutResponse objectForKey:remoteId];
     if (request == nil) {
-        Log(LERROR, @"didWriteWithoutResponse is null");
         return;
     }
-    
+
     // See BmWriteCharacteristicRequest
     NSString  *primaryServiceUuid = request[@"primary_service_uuid"];
     NSString  *serviceUuid        = request[@"service_uuid"];
@@ -2036,28 +2050,26 @@ didDiscoverCharacteristicsForService:(CBService *)service
 
     [self.methodChannel invokeMethod:@"OnCharacteristicWritten" arguments:result];
 
-    // flush queued writes
-    for (NSString *key in [self.writeQueues allKeys]) {
-        [self flushWriteQueueForKey:key];
-    }
+    // clear the pending non-queued write so it is not reported again by
+    // subsequent peripheralIsReadyToSendWriteWithoutResponse callbacks
+    // triggered by queued writes.
+    [self.didWriteWithoutResponse removeObjectForKey:remoteId];
 }
 
-- (void)enqueueWriteTaskForKey:(NSString*)key
+- (BOOL)enqueueWriteTaskForKey:(NSString*)key
                          value:(NSData*)value
                     peripheral:(CBPeripheral*)peripheral
                 characteristic:(CBCharacteristic*)characteristic
 {
-    NSNumber *currentSize = self.writeQueueSizes[key];
-    if (currentSize && [currentSize intValue] >= MAX_QUEUED_WRITES) {
-        Log(LERROR, @"writeCharacteristicQueued: queue full");
-        return;
-    }
-
     NSMutableArray *queue = self.writeQueues[key];
     if (!queue) {
         queue = [NSMutableArray array];
         self.writeQueues[key] = queue;
-        self.writeQueueSizes[key] = @0;
+    }
+
+    if ([queue count] >= MAX_QUEUED_WRITES) {
+        Log(LERROR, @"writeCharacteristicQueued: queue full");
+        return NO;
     }
 
     [queue addObject:@{
@@ -2066,9 +2078,9 @@ didDiscoverCharacteristicsForService:(CBService *)service
         @"characteristic": characteristic,
     }];
 
-    self.writeQueueSizes[key] = @([self.writeQueueSizes[key] intValue] + 1);
-
     [self flushWriteQueueForKey:key];
+
+    return YES;
 }
 
 - (void)flushWriteQueueForKey:(NSString*)key
@@ -2083,7 +2095,6 @@ didDiscoverCharacteristicsForService:(CBService *)service
         }
 
         [queue removeObjectAtIndex:0];
-        self.writeQueueSizes[key] = @([self.writeQueueSizes[key] intValue] - 1);
 
         CBCharacteristic *characteristic = task[@"characteristic"];
         NSData *value = task[@"value"];
