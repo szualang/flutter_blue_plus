@@ -3288,6 +3288,13 @@ public class FlutterBluePlusPlugin implements
                 // Android BLE stack queues these internally; onCharacteristicWrite
                 // is NOT guaranteed to fire for withoutResponse writes, so we cannot
                 // rely on it to trigger the next dequeue.
+                //
+                // Important: even if writeCharacteristic returns non-SUCCESS (e.g. the
+                // characteristic does not declare PROPERTY_WRITE_NO_RESPONSE), we
+                // continue to the next write. Some Android BLE stacks accept the write
+                // at the radio level despite the API-level rejection, and the old
+                // flutter_reactive_ble library successfully used withoutResponse on
+                // the same Cayin CP6 firmware. See: ble_ota_operations_fbp.dart
                 if (task.writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
                     while ((task = queue.poll()) != null) {
                         boolean ok;
@@ -3301,12 +3308,10 @@ public class FlutterBluePlusPlugin implements
                             ok = task.gatt.writeCharacteristic(task.characteristic);
                         }
                         if (!ok) {
-                            Log.e(TAG, "writeCharacteristicQueued burst failed for " + remoteId);
-                            clear(remoteId);
-                            return;
+                            Log.w(TAG, "writeCharacteristicQueued burst write (non-fatal) for " + remoteId);
+                            // non-fatal: continue to next write without clearing queue
                         }
                     }
-                    // queue is now empty; nothing to wait for
                     return;
                 }
 
