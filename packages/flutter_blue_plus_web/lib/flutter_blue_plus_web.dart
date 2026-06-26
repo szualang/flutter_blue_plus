@@ -685,6 +685,13 @@ final class FlutterBluePlusWeb extends FlutterBluePlusPlatform {
   }
 
   @override
+  Future<void> writeCharacteristicQueued(
+    BmWriteCharacteristicRequest request,
+  ) async {
+    throw UnimplementedError('writeCharacteristicQueued has not been implemented.');
+  }
+
+  @override
   Future<bool> writeDescriptor(
     BmWriteDescriptorRequest request,
   ) async {

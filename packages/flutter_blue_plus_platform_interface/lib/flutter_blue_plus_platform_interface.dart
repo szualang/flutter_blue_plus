@@ -289,6 +289,12 @@ abstract base class FlutterBluePlusPlatform {
     return Future.value(false);
   }
 
+  Future<void> writeCharacteristicQueued(
+    BmWriteCharacteristicRequest request,
+  ) async {
+    throw UnimplementedError('writeCharacteristicQueued has not been implemented.');
+  }
+
   Future<bool> writeDescriptor(
     BmWriteDescriptorRequest request,
   ) {

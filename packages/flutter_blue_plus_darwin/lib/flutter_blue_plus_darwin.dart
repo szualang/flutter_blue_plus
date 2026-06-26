@@ -269,6 +269,16 @@ final class FlutterBluePlusDarwin extends FlutterBluePlusPlatform {
   }
 
   @override
+  Future<void> writeCharacteristicQueued(
+    BmWriteCharacteristicRequest request,
+  ) async {
+    await _callDarwinMethod<void>(
+      'writeCharacteristicQueued',
+      request.toMap(),
+    );
+  }
+
+  @override
   Future<bool> writeDescriptor(
     BmWriteDescriptorRequest request,
   ) async {
