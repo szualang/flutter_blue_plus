@@ -1110,8 +1110,14 @@ public class FlutterBluePlusPlugin implements
                     // check max payload
                     int maxLen = getMaxPayload(remoteId, writeType, false);
 
+                    // [FBP-TIMING] 生成 batchId 并记录入队时刻，供 onCharacteristicWrite 计算写入耗时
+                    int batchId = WriteQueueManager.sBatchIdCounter.incrementAndGet();
+                    long batchStartAt = android.os.SystemClock.elapsedRealtime();
+                    Log.i(TAG, "[FBP-TIMING] batchId=" + batchId + " enqueue count=" + values.size());
+
                     // enqueue all values; validate length before any enqueue
                     boolean batchError = false;
+                    int idx = 0;
                     for (byte[] value : values) {
                         if (value.length > maxLen) {
                             String str = "data longer than allowed. dataLen: " + value.length + " > max: " + maxLen;
@@ -1119,7 +1125,9 @@ public class FlutterBluePlusPlugin implements
                             batchError = true;
                             break;
                         }
-                        mWriteQueueManager.enqueue(remoteId, gatt, characteristic, value, writeType);
+                        boolean isLast = (idx == values.size() - 1);
+                        mWriteQueueManager.enqueue(remoteId, gatt, characteristic, value, writeType, batchId, batchStartAt, isLast);
+                        idx++;
                     }
 
                     if (!batchError) {
@@ -3295,6 +3303,10 @@ public class FlutterBluePlusPlugin implements
         private final ConcurrentHashMap<String, Boolean> mIsWriting = new ConcurrentHashMap<>();
         private final ConcurrentHashMap<String, Boolean> mPendingQueuedWrite = new ConcurrentHashMap<>();
         private final Handler mHandler = new Handler(Looper.getMainLooper());
+        // [FBP-TIMING] 当前正在写入的 task（withResponse 路径），供 onCharacteristicWrite 读取 batch 信息
+        private final ConcurrentHashMap<String, WriteTask> mCurrentTask = new ConcurrentHashMap<>();
+        // [FBP-TIMING] 批量写入 ID 计数器（从 1 递增，与 Dart 侧 sector index 差 1）
+        private static final java.util.concurrent.atomic.AtomicInteger sBatchIdCounter = new java.util.concurrent.atomic.AtomicInteger(0);
 
         WriteQueueManager(Map<String, BluetoothGatt> connectedDevices) {
             this.mConnectedDevices = connectedDevices;
@@ -3305,11 +3317,20 @@ public class FlutterBluePlusPlugin implements
             final BluetoothGattCharacteristic characteristic;
             final byte[] value;
             final int writeType;
+            final int batchId;           // [FBP-TIMING] 0 = 单包写入, >0 = 批量写入
+            final long batchStartAt;     // [FBP-TIMING] SystemClock.elapsedRealtime() 批量入队时刻
+            final boolean isLastInBatch; // [FBP-TIMING] 是否为批量中最后一个包
             WriteTask(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte[] value, int writeType) {
+                this(gatt, characteristic, value, writeType, 0, 0L, false);
+            }
+            WriteTask(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte[] value, int writeType, int batchId, long batchStartAt, boolean isLastInBatch) {
                 this.gatt = gatt;
                 this.characteristic = characteristic;
                 this.value = value;
                 this.writeType = writeType;
+                this.batchId = batchId;
+                this.batchStartAt = batchStartAt;
+                this.isLastInBatch = isLastInBatch;
             }
         }
 
@@ -3321,13 +3342,20 @@ public class FlutterBluePlusPlugin implements
         boolean enqueue(String remoteId, BluetoothGatt gatt,
                         BluetoothGattCharacteristic characteristic, byte[] value,
                         int writeType) {
+            return enqueue(remoteId, gatt, characteristic, value, writeType, 0, 0L, false);
+        }
+
+        // [FBP-TIMING] 带 batch 跟踪参数的入队重载
+        boolean enqueue(String remoteId, BluetoothGatt gatt,
+                        BluetoothGattCharacteristic characteristic, byte[] value,
+                        int writeType, int batchId, long batchStartAt, boolean isLastInBatch) {
             synchronized (this) {
                 Queue<WriteTask> queue = mQueues.computeIfAbsent(
                     remoteId, k -> new LinkedBlockingQueue<>());
                 if (queue.size() >= MAX_QUEUED_WRITES) {
                     return false;
                 }
-                queue.offer(new WriteTask(gatt, characteristic, value, writeType));
+                queue.offer(new WriteTask(gatt, characteristic, value, writeType, batchId, batchStartAt, isLastInBatch));
             }
             processNext(remoteId);
             return true;
@@ -3389,6 +3417,8 @@ public class FlutterBluePlusPlugin implements
                     return;
                 }
 
+                mCurrentTask.put(remoteId, task);  // [FBP-TIMING] 供 onCharacteristicWrite 读取 batch 信息
+
                 mIsWriting.put(remoteId, true);
                 mPendingQueuedWrite.put(remoteId, true);
 
@@ -3413,6 +3443,7 @@ public class FlutterBluePlusPlugin implements
         }
 
         void onCharacteristicWrite(String remoteId, int status) {
+            WriteTask completedTask = null;
             synchronized (this) {
                 if (!Boolean.TRUE.equals(mPendingQueuedWrite.remove(remoteId))) {
                     // not a callback triggered by a queued write, ignore
@@ -3424,6 +3455,14 @@ public class FlutterBluePlusPlugin implements
                     clear(remoteId);
                     return;
                 }
+                completedTask = mCurrentTask.remove(remoteId);  // [FBP-TIMING]
+            }
+            // [FBP-TIMING] 批量写入完成时打印耗时（仅最后一个包触发）
+            if (completedTask != null && completedTask.isLastInBatch) {
+                long writeDuration = android.os.SystemClock.elapsedRealtime() - completedTask.batchStartAt;
+                Log.i(TAG, "[FBP-TIMING] batchId=" + completedTask.batchId
+                        + " writeDuration=" + writeDuration + "ms"
+                        + " status=" + status);
             }
             mHandler.post(() -> processNext(remoteId));
         }
@@ -3434,6 +3473,7 @@ public class FlutterBluePlusPlugin implements
                 if (queue != null) queue.clear();
                 mIsWriting.remove(remoteId);
                 mPendingQueuedWrite.remove(remoteId);
+                mCurrentTask.remove(remoteId);  // [FBP-TIMING] 避免泄漏
             }
         }
 
