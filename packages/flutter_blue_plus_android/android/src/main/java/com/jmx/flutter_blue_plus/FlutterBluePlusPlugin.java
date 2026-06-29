@@ -1036,8 +1036,9 @@ public class FlutterBluePlusPlugin implements
                         break;
                     }
                     if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE && !supportsWithoutResponse) {
-                        Log.w(TAG, "writeCharacteristicQueued: WRITE_NO_RESPONSE not declared, "
-                            + "proceeding anyway (flutter_reactive_ble compatibility)");
+                        result.error("writeCharacteristicQueued",
+                            "The WRITE_NO_RESPONSE property is not supported by this BLE characteristic", null);
+                        break;
                     }
 
                     // check maximum payload
@@ -1101,12 +1102,9 @@ public class FlutterBluePlusPlugin implements
                         break;
                     }
                     if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE && !supportsWithoutResponse) {
-                        Log.w(TAG, "writeCharacteristicQueuedBatch: WRITE_NO_RESPONSE not declared, "
-                            + "proceeding anyway (flutter_reactive_ble compatibility)");
-                        // Some Android BLE stacks accept WRITE_CMD at the radio level
-                        // even without PROPERTY_WRITE_NO_RESPONSE. The old
-                        // flutter_reactive_ble library successfully used withoutResponse
-                        // on the same Cayin CP6 firmware. Let the burst path try.
+                        result.error("writeCharacteristicQueuedBatch",
+                            "The WRITE_NO_RESPONSE property is not supported by this BLE characteristic", null);
+                        break;
                     }
 
                     // check max payload
