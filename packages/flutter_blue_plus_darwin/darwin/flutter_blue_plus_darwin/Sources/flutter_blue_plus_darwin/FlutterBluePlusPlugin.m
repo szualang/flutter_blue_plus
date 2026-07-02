@@ -683,10 +683,14 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             NSNumber *writeTypeIndex =    (NSNumber*) args[@"write_type"];
             NSArray *values =             (NSArray*) args[@"values"];
 
+            CBCharacteristicWriteType writeType = [writeTypeIndex intValue] == 0
+                ? CBCharacteristicWriteWithResponse
+                : CBCharacteristicWriteWithoutResponse;
+
             CBPeripheral *peripheral = [self getConnectedPeripheral:remoteId];
             if (!peripheral) {
                 result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch" message:@"device not connected" details:NULL]);
-                break;
+                return;
             }
 
             NSError *error = nil;
@@ -698,7 +702,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                                                                      error:&error];
             if (!characteristic) {
                 result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch" message:error.localizedDescription details:NULL]);
-                break;
+                return;
             }
 
             BOOL supportsWriteWithResponse = (characteristic.properties & CBCharacteristicPropertyWrite) != 0;
@@ -707,12 +711,12 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             if ([writeTypeIndex intValue] == 1 && !supportsWriteWithoutResponse) {
                 result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch"
                                            message:@"writeWithoutResponse not supported" details:NULL]);
-                break;
+                return;
             }
             if ([writeTypeIndex intValue] == 0 && !supportsWriteWithResponse) {
                 result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch"
                                            message:@"writeWithResponse not supported" details:NULL]);
-                break;
+                return;
             }
 
             int maxLen;
@@ -729,15 +733,19 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                 if ((int)[value length] > maxLen) {
                     result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch"
                                                message:@"value too long" details:NULL]);
-                    break;
+                    return;
                 }
 
-                BOOL enqueued = [self enqueueWriteTaskForKey:key value:value peripheral:peripheral characteristic:characteristic];
+                BOOL enqueued = [self enqueueWriteTaskForKey:key
+                                                       value:value
+                                                  peripheral:peripheral
+                                              characteristic:characteristic
+                                                   writeType:writeType];
                 if (!enqueued) {
                     result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch"
                                                message:@"write queue is full"
                                               details:NULL]);
-                    break;
+                    return;
                 }
             }
 
