@@ -729,7 +729,9 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             NSString *primarySvcKey = primaryServiceUuid ?: @"";
             NSString *key = [NSString stringWithFormat:@"%@:%@:%@:%@:%@", remoteId, primarySvcKey, serviceUuid, characteristicUuid, instanceId];
 
-            for (NSData *value in values) {
+            for (FlutterStandardTypedData *typedData in values) {
+                NSData *value = typedData.data;
+
                 if ((int)[value length] > maxLen) {
                     result([FlutterError errorWithCode:@"writeCharacteristicQueuedBatch"
                                                message:@"value too long" details:NULL]);
