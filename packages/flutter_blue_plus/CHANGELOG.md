@@ -1,3 +1,6 @@
+## 2.3.9+ota.1
+* **[Feature]** add writeQueued API for high-throughput Write Without Response
+
 ## 2.3.9
 * **[Android]** rename `com.lib.flutter_blue_plus` to `com.jmx.flutter_blue_plus`
 * **[LICENSE]** add `Corporate` tier for 250+ employees

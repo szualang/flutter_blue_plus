@@ -44,11 +44,13 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.io.StringWriter;
 import java.io.PrintWriter;
@@ -112,6 +114,7 @@ public class FlutterBluePlusPlugin implements
     private final Map<String, BluetoothGatt> mAutoConnected = new ConcurrentHashMap<>();
     private final Map<String, byte[]> mWriteChr = new ConcurrentHashMap<>();
     private final Map<String, byte[]> mWriteDesc = new ConcurrentHashMap<>();
+    private final WriteQueueManager mWriteQueueManager = new WriteQueueManager(mConnectedDevices);
     private final Map<String, String> mAdvSeen = new ConcurrentHashMap<>();
     private final Map<String, Integer> mScanCounts = new ConcurrentHashMap<>();
     private HashMap<String, Object> mScanFilters = new HashMap<String, Object>();
@@ -988,6 +991,148 @@ public class FlutterBluePlusPlugin implements
                     }
 
                     result.success(true);
+                    break;
+                }
+
+                case "writeCharacteristicQueued":
+                {
+                    // see: BmWriteCharacteristicRequest
+                    HashMap<String, Object> data = call.arguments();
+                    String remoteId =           (String) data.get("remote_id");
+                    String primaryServiceUuid = (String) data.get("primary_service_uuid");
+                    String serviceUuid =        (String) data.get("service_uuid");
+                    String characteristicUuid = (String) data.get("characteristic_uuid");
+                    Integer instanceId =       (Integer) data.get("instance_id");
+                    byte[] value =              (byte[]) data.get("value");
+                    int writeTypeInt =             (int) data.get("write_type");
+
+                    int writeType = writeTypeInt == 0 ?
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT :
+                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE;
+
+                    // check connection
+                    BluetoothGatt gatt = mConnectedDevices.get(remoteId);
+                    if (gatt == null) {
+                        result.error("writeCharacteristicQueued", "device is disconnected", null);
+                        break;
+                    }
+
+                    // find characteristic
+                    ChrFound found = locateCharacteristic(gatt, primaryServiceUuid, serviceUuid, characteristicUuid, instanceId);
+                    if (found.error != null) {
+                        result.error("writeCharacteristicQueued", found.error, null);
+                        break;
+                    }
+
+                    BluetoothGattCharacteristic characteristic = found.characteristic;
+
+                    // check writeable
+                    int props = characteristic.getProperties();
+                    boolean supportsWithResponse = (props & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0;
+                    boolean supportsWithoutResponse = (props & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0;
+                    if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT && !supportsWithResponse) {
+                        result.error("writeCharacteristicQueued",
+                            "The WRITE property is not supported by this BLE characteristic", null);
+                        break;
+                    }
+                    if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE && !supportsWithoutResponse) {
+                        result.error("writeCharacteristicQueued",
+                            "The WRITE_NO_RESPONSE property is not supported by this BLE characteristic", null);
+                        break;
+                    }
+
+                    // check maximum payload
+                    int maxLen = getMaxPayload(remoteId, writeType, false);
+                    int dataLen = value.length;
+                    if (dataLen > maxLen) {
+                        String str = "data longer than allowed. dataLen: " + dataLen + " > max: " + maxLen;
+                        result.error("writeCharacteristicQueued", str, null);
+                        break;
+                    }
+
+                    // enqueue the write
+                    if (!mWriteQueueManager.enqueue(remoteId, gatt, characteristic, value, writeType)) {
+                        result.error("writeCharacteristicQueued", "write queue is full", null);
+                        break;
+                    }
+
+                    result.success(true);
+                    break;
+                }
+
+                case "writeCharacteristicQueuedBatch":
+                {
+                    // see: BmWriteCharacteristicBatchRequest
+                    HashMap<String, Object> data = call.arguments();
+                    String remoteId =              (String) data.get("remote_id");
+                    String primaryServiceUuid =    (String) data.get("primary_service_uuid");
+                    String serviceUuid =           (String) data.get("service_uuid");
+                    String characteristicUuid =    (String) data.get("characteristic_uuid");
+                    Integer instanceId =           (Integer) data.get("instance_id");
+                    int writeTypeInt =             (int) data.get("write_type");
+                    ArrayList<byte[]> values =     (ArrayList<byte[]>) data.get("values");
+
+                    int writeType = writeTypeInt == 0 ?
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT :
+                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE;
+
+                    // check connection
+                    BluetoothGatt gatt = mConnectedDevices.get(remoteId);
+                    if (gatt == null) {
+                        result.error("writeCharacteristicQueuedBatch", "device is disconnected", null);
+                        break;
+                    }
+
+                    // find characteristic
+                    ChrFound found = locateCharacteristic(gatt, primaryServiceUuid, serviceUuid, characteristicUuid, instanceId);
+                    if (found.error != null) {
+                        result.error("writeCharacteristicQueuedBatch", found.error, null);
+                        break;
+                    }
+
+                    BluetoothGattCharacteristic characteristic = found.characteristic;
+
+                    // check writable
+                    int props = characteristic.getProperties();
+                    boolean supportsWithResponse = (props & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0;
+                    boolean supportsWithoutResponse = (props & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0;
+                    if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT && !supportsWithResponse) {
+                        result.error("writeCharacteristicQueuedBatch",
+                            "The WRITE property is not supported by this BLE characteristic", null);
+                        break;
+                    }
+                    if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE && !supportsWithoutResponse) {
+                        result.error("writeCharacteristicQueuedBatch",
+                            "The WRITE_NO_RESPONSE property is not supported by this BLE characteristic", null);
+                        break;
+                    }
+
+                    // check max payload
+                    int maxLen = getMaxPayload(remoteId, writeType, false);
+
+                    // [FBP-TIMING] 生成 batchId 并记录入队时刻，供 onCharacteristicWrite 计算写入耗时
+                    int batchId = WriteQueueManager.sBatchIdCounter.incrementAndGet();
+                    long batchStartAt = android.os.SystemClock.elapsedRealtime();
+                    Log.i(TAG, "[FBP-TIMING] batchId=" + batchId + " enqueue count=" + values.size());
+
+                    // enqueue all values; validate length before any enqueue
+                    boolean batchError = false;
+                    int idx = 0;
+                    for (byte[] value : values) {
+                        if (value.length > maxLen) {
+                            String str = "data longer than allowed. dataLen: " + value.length + " > max: " + maxLen;
+                            result.error("writeCharacteristicQueuedBatch", str, null);
+                            batchError = true;
+                            break;
+                        }
+                        boolean isLast = (idx == values.size() - 1);
+                        mWriteQueueManager.enqueue(remoteId, gatt, characteristic, value, writeType, batchId, batchStartAt, isLast);
+                        idx++;
+                    }
+
+                    if (!batchError) {
+                        result.success(true);
+                    }
                     break;
                 }
 
@@ -2284,6 +2429,9 @@ public class FlutterBluePlusPlugin implements
                     // remove from cached PINs
                     mBondingPins.remove(remoteId);
 
+                    // clear queued writes
+                    mWriteQueueManager.onDisconnected(remoteId);
+
                     // we cannot call 'close' for autoconnected devices
                     // because it prevents autoconnect from working
                     if (mAutoConnected.containsKey(remoteId)) {
@@ -2490,6 +2638,8 @@ public class FlutterBluePlusPlugin implements
             response.put("error_string", gattErrorString(status));
 
             invokeMethodUIThread("OnCharacteristicWritten", response);
+
+            mWriteQueueManager.onCharacteristicWrite(remoteId, status);
         }
 
         @Override
@@ -3144,5 +3294,191 @@ public class FlutterBluePlusPlugin implements
         INFO,    // 3
         DEBUG,   // 4
         VERBOSE  // 5
+    }
+
+    private static class WriteQueueManager {
+        static final int MAX_QUEUED_WRITES = 1000;
+        private final Map<String, BluetoothGatt> mConnectedDevices;
+        private final ConcurrentHashMap<String, Queue<WriteTask>> mQueues = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<String, Boolean> mIsWriting = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<String, Boolean> mPendingQueuedWrite = new ConcurrentHashMap<>();
+        private final Handler mHandler = new Handler(Looper.getMainLooper());
+        // [FBP-TIMING] 当前正在写入的 task（withResponse 路径），供 onCharacteristicWrite 读取 batch 信息
+        private final ConcurrentHashMap<String, WriteTask> mCurrentTask = new ConcurrentHashMap<>();
+        // [FBP-TIMING] 批量写入 ID 计数器（从 1 递增，与 Dart 侧 sector index 差 1）
+        private static final java.util.concurrent.atomic.AtomicInteger sBatchIdCounter = new java.util.concurrent.atomic.AtomicInteger(0);
+
+        WriteQueueManager(Map<String, BluetoothGatt> connectedDevices) {
+            this.mConnectedDevices = connectedDevices;
+        }
+
+        static class WriteTask {
+            final BluetoothGatt gatt;
+            final BluetoothGattCharacteristic characteristic;
+            final byte[] value;
+            final int writeType;
+            final int batchId;           // [FBP-TIMING] 0 = 单包写入, >0 = 批量写入
+            final long batchStartAt;     // [FBP-TIMING] SystemClock.elapsedRealtime() 批量入队时刻
+            final boolean isLastInBatch; // [FBP-TIMING] 是否为批量中最后一个包
+            WriteTask(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte[] value, int writeType) {
+                this(gatt, characteristic, value, writeType, 0, 0L, false);
+            }
+            WriteTask(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte[] value, int writeType, int batchId, long batchStartAt, boolean isLastInBatch) {
+                this.gatt = gatt;
+                this.characteristic = characteristic;
+                this.value = value;
+                this.writeType = writeType;
+                this.batchId = batchId;
+                this.batchStartAt = batchStartAt;
+                this.isLastInBatch = isLastInBatch;
+            }
+        }
+
+        int size(String remoteId) {
+            Queue<WriteTask> queue = mQueues.get(remoteId);
+            return queue == null ? 0 : queue.size();
+        }
+
+        boolean enqueue(String remoteId, BluetoothGatt gatt,
+                        BluetoothGattCharacteristic characteristic, byte[] value,
+                        int writeType) {
+            return enqueue(remoteId, gatt, characteristic, value, writeType, 0, 0L, false);
+        }
+
+        // [FBP-TIMING] 带 batch 跟踪参数的入队重载
+        boolean enqueue(String remoteId, BluetoothGatt gatt,
+                        BluetoothGattCharacteristic characteristic, byte[] value,
+                        int writeType, int batchId, long batchStartAt, boolean isLastInBatch) {
+            synchronized (this) {
+                Queue<WriteTask> queue = mQueues.computeIfAbsent(
+                    remoteId, k -> new LinkedBlockingQueue<>());
+                if (queue.size() >= MAX_QUEUED_WRITES) {
+                    return false;
+                }
+                queue.offer(new WriteTask(gatt, characteristic, value, writeType, batchId, batchStartAt, isLastInBatch));
+            }
+            processNext(remoteId);
+            return true;
+        }
+
+        void processNext(String remoteId) {
+            synchronized (this) {
+                if (Boolean.TRUE.equals(mIsWriting.get(remoteId))) return;
+                Queue<WriteTask> queue = mQueues.get(remoteId);
+                if (queue == null || queue.isEmpty()) return;
+
+                // peek at the next task to determine write type
+                WriteTask task = queue.peek();
+                if (task == null) {
+                    return;
+                }
+
+                // make sure the gatt is still the connected one
+                BluetoothGatt currentGatt = mConnectedDevices.get(remoteId);
+                if (currentGatt == null || currentGatt != task.gatt) {
+                    clear(remoteId);
+                    return;
+                }
+
+                // For WRITE_TYPE_NO_RESPONSE: fire all waiting writes in a burst.
+                // Android BLE stack queues these internally; onCharacteristicWrite
+                // is NOT guaranteed to fire for withoutResponse writes, so we cannot
+                // rely on it to trigger the next dequeue.
+                //
+                // Important: even if writeCharacteristic returns non-SUCCESS (e.g. the
+                // characteristic does not declare PROPERTY_WRITE_NO_RESPONSE), we
+                // continue to the next write. Some Android BLE stacks accept the write
+                // at the radio level despite the API-level rejection, and the old
+                // flutter_reactive_ble library successfully used withoutResponse on
+                // the same Cayin CP6 firmware. See: ble_ota_operations_fbp.dart
+                if (task.writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
+                    while ((task = queue.poll()) != null) {
+                        boolean ok;
+                        if (Build.VERSION.SDK_INT >= 33) {
+                            int rv = task.gatt.writeCharacteristic(
+                                task.characteristic, task.value, task.writeType);
+                            ok = (rv == BluetoothStatusCodes.SUCCESS);
+                        } else {
+                            task.characteristic.setValue(task.value);
+                            task.characteristic.setWriteType(task.writeType);
+                            ok = task.gatt.writeCharacteristic(task.characteristic);
+                        }
+                        if (!ok) {
+                            Log.w(TAG, "writeCharacteristicQueued burst write (non-fatal) for " + remoteId);
+                            // non-fatal: continue to next write without clearing queue
+                        }
+                    }
+                    return;
+                }
+
+                // For WRITE_TYPE_DEFAULT (withResponse): serialized, one at a time
+                task = queue.poll();
+                if (task == null) {
+                    return;
+                }
+
+                mCurrentTask.put(remoteId, task);  // [FBP-TIMING] 供 onCharacteristicWrite 读取 batch 信息
+
+                mIsWriting.put(remoteId, true);
+                mPendingQueuedWrite.put(remoteId, true);
+
+                boolean ok;
+                if (Build.VERSION.SDK_INT >= 33) {
+                    int rv = task.gatt.writeCharacteristic(
+                        task.characteristic, task.value, task.writeType);
+                    ok = (rv == BluetoothStatusCodes.SUCCESS);
+                } else {
+                    task.characteristic.setValue(task.value);
+                    task.characteristic.setWriteType(task.writeType);
+                    ok = task.gatt.writeCharacteristic(task.characteristic);
+                }
+
+                if (!ok) {
+                    mPendingQueuedWrite.remove(remoteId);
+                    mIsWriting.put(remoteId, false);
+                    Log.e(TAG, "writeCharacteristicQueued failed to initiate for " + remoteId);
+                    clear(remoteId);
+                }
+            }
+        }
+
+        void onCharacteristicWrite(String remoteId, int status) {
+            WriteTask completedTask = null;
+            synchronized (this) {
+                if (!Boolean.TRUE.equals(mPendingQueuedWrite.remove(remoteId))) {
+                    // not a callback triggered by a queued write, ignore
+                    return;
+                }
+                mIsWriting.put(remoteId, false);
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.e(TAG, "writeCharacteristicQueued failed with status " + status + " for " + remoteId);
+                    clear(remoteId);
+                    return;
+                }
+                completedTask = mCurrentTask.remove(remoteId);  // [FBP-TIMING]
+            }
+            // [FBP-TIMING] 批量写入完成时打印耗时（仅最后一个包触发）
+            if (completedTask != null && completedTask.isLastInBatch) {
+                long writeDuration = android.os.SystemClock.elapsedRealtime() - completedTask.batchStartAt;
+                Log.i(TAG, "[FBP-TIMING] batchId=" + completedTask.batchId
+                        + " writeDuration=" + writeDuration + "ms"
+                        + " status=" + status);
+            }
+            mHandler.post(() -> processNext(remoteId));
+        }
+
+        void clear(String remoteId) {
+            synchronized (this) {
+                Queue<WriteTask> queue = mQueues.remove(remoteId);
+                if (queue != null) queue.clear();
+                mIsWriting.remove(remoteId);
+                mPendingQueuedWrite.remove(remoteId);
+                mCurrentTask.remove(remoteId);  // [FBP-TIMING] 避免泄漏
+            }
+        }
+
+        void onDisconnected(String remoteId) {
+            clear(remoteId);
+        }
     }
 }

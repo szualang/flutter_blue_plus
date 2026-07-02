@@ -406,6 +406,26 @@ final class FlutterBluePlusAndroid extends FlutterBluePlusPlatform {
   }
 
   @override
+  Future<void> writeCharacteristicQueued(
+    BmWriteCharacteristicRequest request,
+  ) async {
+    await _callAndroidMethod<void>(
+      'writeCharacteristicQueued',
+      request.toMap(),
+    );
+  }
+
+  @override
+  Future<void> writeCharacteristicQueuedBatch(
+    BmWriteCharacteristicBatchRequest request,
+  ) async {
+    await _callAndroidMethod<void>(
+      'writeCharacteristicQueuedBatch',
+      request.toMap(),
+    );
+  }
+
+  @override
   Future<bool> writeDescriptor(
     BmWriteDescriptorRequest request,
   ) async {

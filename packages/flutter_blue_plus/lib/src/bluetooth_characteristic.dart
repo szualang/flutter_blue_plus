@@ -249,6 +249,77 @@ class BluetoothCharacteristic {
     }
   }
 
+  /// Write a value to the characteristic without waiting for the platform response
+  /// event. This is intended for high-throughput scenarios (e.g. OTA streaming)
+  /// where writes should be queued by the platform rather than awaited one-by-one.
+  ///
+  /// This method returns as soon as the request has been handed to the platform;
+  /// it does not wait for the packet to be sent and therefore has no timeout.
+  ///
+  ///  - [withoutResponse]: defaults to `true`. Pass `false` for with-response writes
+  ///    that will be queued in the native layer and flushed via onCharacteristicWrite
+  ///    callbacks.
+  Future<void> writeQueued(
+    List<int> value, {
+    bool withoutResponse = true,
+  }) async {
+    if (device.isDisconnected) {
+      throw FlutterBluePlusException(ErrorPlatform.fbp, "writeCharacteristicQueued",
+          FbpErrorCode.deviceIsDisconnected.index, "device is not connected");
+    }
+
+    var request = BmWriteCharacteristicRequest(
+      remoteId: remoteId,
+      primaryServiceUuid: primaryServiceUuid,
+      serviceUuid: serviceUuid,
+      characteristicUuid: characteristicUuid,
+      instanceId: instanceId,
+      writeType: withoutResponse ? BmWriteType.withoutResponse : BmWriteType.withResponse,
+      allowLongWrite: false,
+      value: value,
+    );
+
+    await FlutterBluePlus._invokePlatform(
+      () => FlutterBluePlusPlatform.instance.writeCharacteristicQueued(request),
+    );
+  }
+
+  /// Writes a batch of values to the characteristic. All values are enqueued
+  /// in the native write queue in a single platform call, avoiding per-packet
+  /// method channel round-trips.
+  ///
+  /// This is intended for high-throughput scenarios (e.g. OTA streaming) where
+  /// many packets are sent back-to-back with the same characteristic parameters.
+  ///
+  /// The [values] list contains the raw byte payloads. Each element corresponds
+  /// to one write. The platform layer will enqueue them all and process them
+  /// sequentially through the write queue.
+  Future<void> writeQueuedBatch(
+    List<List<int>> values, {
+    bool withoutResponse = false,
+  }) async {
+    if (device.isDisconnected) {
+      throw FlutterBluePlusException(ErrorPlatform.fbp, "writeCharacteristicQueuedBatch",
+          FbpErrorCode.deviceIsDisconnected.index, "device is not connected");
+    }
+
+    if (values.isEmpty) return;
+
+    var request = BmWriteCharacteristicBatchRequest(
+      remoteId: remoteId,
+      primaryServiceUuid: primaryServiceUuid,
+      serviceUuid: serviceUuid,
+      characteristicUuid: characteristicUuid,
+      instanceId: instanceId,
+      writeType: withoutResponse ? BmWriteType.withoutResponse : BmWriteType.withResponse,
+      values: values.map((v) => Uint8List.fromList(v)).toList(),
+    );
+
+    await FlutterBluePlus._invokePlatform(
+      () => FlutterBluePlusPlatform.instance.writeCharacteristicQueuedBatch(request),
+    );
+  }
+
   /// Sets notifications or indications for the characteristic.
   ///   - If a characteristic supports both notifications and indications,
   ///     we use notifications. This is a limitation of CoreBluetooth on iOS.

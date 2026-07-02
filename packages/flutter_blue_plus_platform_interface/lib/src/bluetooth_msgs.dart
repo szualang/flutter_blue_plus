@@ -580,6 +580,42 @@ class BmWriteCharacteristicRequest {
   }
 }
 
+/// Batch variant of [BmWriteCharacteristicRequest].
+/// Accepts multiple values to be enqueued in a single platform call,
+/// avoiding per-packet method channel round-trips for OTA streaming.
+class BmWriteCharacteristicBatchRequest {
+  final DeviceIdentifier remoteId;
+  final Guid? primaryServiceUuid;
+  final Guid serviceUuid;
+  final Guid characteristicUuid;
+  final int instanceId;
+  final BmWriteType writeType;
+  final List<Uint8List> values;
+
+  BmWriteCharacteristicBatchRequest({
+    required this.remoteId,
+    required this.primaryServiceUuid,
+    required this.serviceUuid,
+    required this.characteristicUuid,
+    required this.instanceId,
+    required this.writeType,
+    required this.values,
+  });
+
+  Map<dynamic, dynamic> toMap() {
+    final Map<dynamic, dynamic> data = {};
+    data['remote_id'] = remoteId.str;
+    data['primary_service_uuid'] = primaryServiceUuid?.str;
+    data['service_uuid'] = serviceUuid.str;
+    data['characteristic_uuid'] = characteristicUuid.str;
+    data['instance_id'] = instanceId;
+    data['write_type'] = writeType.index;
+    data['values'] = values;
+    data.removeWhere((key, value) => value == null);
+    return data;
+  }
+}
+
 class BmWriteDescriptorRequest {
   final DeviceIdentifier remoteId;
   final Guid? primaryServiceUuid;
